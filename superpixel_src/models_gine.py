@@ -1,0 +1,184 @@
+import torch
+import torch.backends.cudnn as cudnn
+import torch_geometric as geom
+
+torch.manual_seed(0)
+cudnn.deterministic = True
+cudnn.benchmark = False
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+from prettytable import PrettyTable
+
+
+def count_parameters(model):
+    table = PrettyTable(["Modules", "Parameters"])
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        param = parameter.numel()
+        table.add_row([name, param])
+        total_params += param
+    print(table)
+    print(f"Total Trainable Params: {total_params}")
+    return total_params
+
+
+class multiSequential(nn.Sequential):
+    def forward(self, *inputs):
+        for module in self._modules.values():
+            if type(inputs) == tuple:
+                inputs = module(*inputs)
+            else:
+                inputs = module(inputs)
+        return inputs
+
+
+class MLP(nn.Module):
+    """MLP with linear output"""
+
+    def __init__(self, num_layers, input_dim, hidden_dim, output_dim):
+
+        super().__init__()
+        self.linear_or_not = True  # default is linear model
+        self.num_layers = num_layers
+        self.output_dim = output_dim
+        self.input_dim = input_dim
+
+        if num_layers < 1:
+            raise ValueError("number of layers should be positive!")
+        elif num_layers == 1:
+            # Linear model
+            self.linear = nn.Linear(input_dim, output_dim)
+        else:
+            # Multi-layer model
+            self.linear_or_not = False
+            self.linears = torch.nn.ModuleList()
+            self.batch_norms = torch.nn.ModuleList()
+
+            self.linears.append(nn.Linear(input_dim, hidden_dim))
+            for layer in range(num_layers - 2):
+                self.linears.append(nn.Linear(hidden_dim, hidden_dim))
+            self.linears.append(nn.Linear(hidden_dim, output_dim))
+
+            for layer in range(num_layers - 1):
+                self.batch_norms.append(nn.BatchNorm1d((hidden_dim), affine=True))
+
+    def forward(self, x):
+        if self.linear_or_not:
+            # If linear model
+            return self.linear(x)
+        else:
+            # If MLP
+            h = x
+            for i in range(self.num_layers - 1):
+                h = F.relu(self.batch_norms[i](self.linears[i](h)))
+            return self.linears[-1](h)
+
+
+class MNIST_GNN(torch.nn.Module):
+    def __init__(self, args):
+        super(MNIST_GNN, self).__init__()
+
+        self.embedding_h = torch.nn.Linear(args.input_dim, args.hidden_dim)
+        # self.embedding_c = torch.nn.Linear(1, args.hidden_dim)
+
+        self.ginlayers = torch.nn.ModuleList()
+        self.bnlayers = torch.nn.ModuleList()
+        for layer in range(args.num_layers):
+            self.bnlayers.append(torch.nn.BatchNorm1d(args.hidden_dim, affine=True))
+        for layer in range(args.num_layers):
+            mlp = MLP(
+                args.num_mlp_layers, args.hidden_dim, args.hidden_dim, args.hidden_dim
+            )
+            self.ginlayers.append(geom.nn.GINConv(mlp, train_eps=True))
+        self.linears_prediction = torch.nn.ModuleList()
+        self.args = args
+        self.num_layers = args.num_layers
+
+        if args.supervised == True:
+            self.supervised = True
+            for layer in range(args.num_layers + 1):
+                self.linears_prediction.append(
+                    nn.Linear(args.hidden_dim, args.num_classes)
+                )
+        else:
+            self.supervised = False
+
+        if self.args.readout == "sum":
+            self.pool = geom.nn.global_add_pool
+        elif self.args.readout == "mean":
+            self.pool = geom.nn.global_mean_pool
+        elif args.readout == "max":
+            self.pool = geom.nn.global_max_pool
+        else:
+            raise NotImplementedError
+
+    def forward(self, x, edge_index, edge_attr, batch):
+
+        hidden_rep = []
+        x = self.embedding_h(x)
+        hidden_rep.append(self.pool(x, batch))
+        for i in range(self.args.num_layers):
+            x = self.ginlayers[i](x, edge_index)
+            x = self.bnlayers[i](x)
+            hidden_rep.append(self.pool(x, batch))
+        if self.supervised:
+            score_over_layer = 0
+            for i, x_p in enumerate(hidden_rep):
+                score_over_layer += self.linears_prediction[i](x_p)
+            return x, score_over_layer
+        x = torch.cat(hidden_rep, dim=1)
+        return x
+
+
+class SimSiam(nn.Module):
+    def __init__(self, backbone, args):  # ,out_dim=60
+        super().__init__()
+
+        self.args = args
+        self.project_dim = args.project_dim
+        self.predictor_dim = args.predictor_dim
+        self.bottle_neck_dim = args.bottle_neck_dim
+        self.hidden_dim = args.hidden_dim
+        self.num_layers = args.num_layers
+
+        self.projector = torch.nn.Sequential(
+            torch.nn.Linear(
+                self.hidden_dim * (self.num_layers + 1),
+                self.project_dim,
+                bias=False,
+            ),
+            torch.nn.BatchNorm1d(self.project_dim),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(self.project_dim, self.predictor_dim, bias=False),
+            torch.nn.BatchNorm1d(self.predictor_dim),
+        )
+
+        if args.intermediate_bn:
+            self.bn_int = torch.nn.BatchNorm1d(self.hidden_dim * (self.num_layers + 1))
+            self.encoder = multiSequential(self.backbone, self.bn_int, self.projector)
+
+        else:
+            args.bn_int = None
+            self.encoder = multiSequential(backbone, self.projector)
+
+        self.predictor = torch.nn.Sequential(
+            torch.nn.Linear(self.predictor_dim, self.bottle_neck_dim, bias=False),
+            torch.nn.BatchNorm1d(self.bottle_neck_dim),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(self.bottle_neck_dim, self.predictor_dim),
+        )
+
+    def forward(self, data_1, data_2):
+        f, h = self.encoder, self.predictor
+        z1 = f(data_1.x, data_1.edge_index, data_1.edge_attr, data_1.batch)
+        z2 = f(data_2.x, data_2.edge_index, data_2.edge_attr, data_2.batch)
+        p1, p2 = h(z1), h(z2)
+        L = self.D_simplified(p1, z2) / 2 + self.D_simplified(p2, z1) / 2
+        return L
+
+    def D_simplified(self, p, z):
+        return -torch.nn.functional.cosine_similarity(p, z.detach(), dim=-1).mean()

@@ -1,0 +1,369 @@
+import torch
+import torch.backends.cudnn as cudnn
+import torch_geometric as geom
+import numpy as np
+import torch.nn.functional as F
+import torchvision
+
+torch.manual_seed(0)
+np.random.seed(0)
+cudnn.deterministic = True
+cudnn.benchmark = False
+
+import collections
+from copy import deepcopy
+from utils import dotdict
+import tqdm
+from models_gine import MNIST_GNN, SimSiam, count_parameters
+from datasets_mnist import *
+from knn_monitor import knn_monitor_gine
+import pdb
+import sys
+
+
+def run_unsupervised(
+    model,
+    optimizer,
+    scheduler,
+    train_loader,
+    test_loader,
+    val_loader,
+    args,
+    model_id,
+):
+    # TODO: See if Ckpt to resume
+    best_epoch = 0.0
+    best_ckpt = {}
+    losses = collections.defaultdict(list)
+    last_five = args.epochs - 5
+    knn_acc = np.nan
+    try:
+        with tqdm.tqdm(
+            total=args.epochs,
+            postfix="{desc}",
+            position=0,
+            leave=False,
+            ascii=True,
+        ) as pbar:
+            for i in range(args.epochs):
+                model.train()
+                running_loss = 0.0
+
+                running_backbone_norm = 0.0
+                running_encoder_norm = 0.0
+                running_predictor_norm = 0.0
+
+                running_backbone_std = 0.0
+                running_encoder_std = 0.0
+                running_predictor_std = 0.0
+
+                for data in train_loader:
+                    view_1 = data[0][0].to(args.device)
+                    view_2 = data[0][1].to(args.device)
+
+                    optimizer.zero_grad()
+                    # compute embeddings
+                    L = model(view_1, view_2)
+                    # calculate loss
+                    L.backward()
+                    # take optimizer step
+                    if args.clip_grad:
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), 2.0
+                        )  # CHECK THIS?
+                    optimizer.step()
+
+                    # bookkeeping
+                    model.eval()
+                    with torch.no_grad():
+                        running_loss += L.item()
+
+                        b1 = model.encoder[0](
+                            view_1.x, view_1.edge_index, view_1.edge_attr, view_1.batch
+                        )
+                        b2 = model.encoder[0](
+                            view_2.x, view_2.edge_index, view_2.edge_attr, view_2.batch
+                        )
+
+                        p1 = model.encoder(
+                            view_1.x, view_1.edge_index, view_1.edge_attr, view_1.batch
+                        )
+                        p2 = model.encoder(
+                            view_2.x, view_2.edge_index, view_2.edge_attr, view_2.batch
+                        )
+
+                        z1 = model.predictor(p1)
+                        z2 = model.predictor(p2)
+
+                        # similarities
+                        b_sim = F.cosine_similarity(b1, b2, dim=1).mean()
+                        p_sim = F.cosine_similarity(p1, p2, dim=1).mean()
+                        z_sim = F.cosine_similarity(z1, z2, dim=1).mean()
+
+                        # norms & std
+                        running_backbone_norm += b1.norm(dim=1).mean()
+                        running_backbone_std += (
+                            (b1 / b1.norm(dim=1, keepdim=True)).std(dim=0).mean()
+                        )
+
+                        running_encoder_norm += p1.norm(dim=1).mean()
+                        running_encoder_std += (
+                            (p1 / p1.norm(dim=1, keepdim=True)).std(dim=0).mean()
+                        )
+
+                        running_predictor_norm += z1.norm(dim=1).mean()
+                        running_predictor_std += (
+                            (z1 / z1.norm(dim=1, keepdim=True)).std(dim=0).mean()
+                        )
+
+                        losses["backbone_sim"].append(b_sim.item())
+                        losses["encoder_sim"].append(p_sim.item())
+                        losses["predictor_sim"].append(z_sim.item())
+                    model.train()
+
+                # KNN Acc
+                knn_acc = knn_monitor_gine(
+                    net=model.encoder[0],
+                    val_data_loader=val_loader,
+                    test_data_loader=test_loader,
+                    epoch=i,
+                    args=args,
+                    k=10,
+                    t=0.1,
+                    hide_progress=True,
+                )
+
+                # bookkeeping
+                running_loss /= train_loader.__len__()
+                running_backbone_norm /= train_loader.__len__()
+                running_backbone_std /= train_loader.__len__()
+                running_encoder_norm /= train_loader.__len__()
+                running_encoder_std /= train_loader.__len__()
+                running_predictor_norm /= train_loader.__len__()
+                running_predictor_std /= train_loader.__len__()
+
+                losses["epoch_loss"].append(running_loss)
+                losses["knn_acc"].append(knn_acc)
+                losses["backbone_norm"].append(running_backbone_norm)
+                losses["backbone_std"].append(running_backbone_std)
+                losses["encoder_norm"].append(running_encoder_norm)
+                losses["encoder_std"].append(running_encoder_std)
+                losses["predictor_norm"].append(running_predictor_norm)
+                losses["predictor_std"].append(running_predictor_std)
+
+                pbar.set_postfix_str(
+                    "Loss: {l:.4f} -- KNN Acc: {knn:.4f} -- BBS: {bbn:.4f}  PS: {ps:.4f}".format(
+                        l=losses["epoch_loss"][-1],
+                        knn=knn_acc,
+                        bbn=b_sim.item(),
+                        ps=p_sim.item(),
+                    )
+                )
+                pbar.update(1)
+
+                ckpt = {}
+                ckpt["epoch"] = i
+                ckpt["knn_acc"] = knn_acc
+                ckpt["model"] = model.state_dict()
+                ckpt["args"] = dict(args)
+                ckpt["stats"] = losses
+                torch.save(
+                    ckpt,
+                    "GINE_CKPTS/{model_id}_{aug_type}_{aug_ratio}_epoch_{e}.pth".format(
+                        model_id=model_id,
+                        aug_type=args.aug_type,
+                        aug_ratio=args.aug_ratio,
+                        e=i,
+                    ),
+                )
+                if knn_acc > best_epoch:
+                    best_ckpt["unsupervised_best_epoch"] = i
+                    best_ckpt["knn_acc"] = knn_acc
+                    best_ckpt["model"] = model.state_dict()
+                    best_ckpt["args"] = dict(args)
+                    best_ckpt["stats"] = losses
+                    best_epoch = knn_acc
+                    torch.save(
+                        best_ckpt,
+                        "CKPTS/best_{model_id}_{aug_type}_{aug_ratio}.pth".format(
+                            model_id=model_id,
+                            aug_type=args.aug_type,
+                            aug_ratio=args.aug_ratio,
+                        ),
+                    )
+                    print("Epoch {0} -- Best Acc: {1:.4f} ".format(i, best_epoch))
+
+                if scheduler is not None:
+                    scheduler.step()
+
+    except KeyboardInterrupt:
+        print("*" * 50)
+        print("CRTL-C EARLY TRAINING INTERUPT")
+        print("SAVING INTERMEDIATE CKPT")
+
+        final_ckpt = {}
+        final_ckpt["knn_acc"] = knn_acc
+        final_ckpt["net"] = model.state_dict()
+        final_ckpt["args"] = dict(args)
+        final_ckpt["stats"] = losses
+        final_ckpt["interupted_epoch"] = i
+        torch.save(
+            final_ckpt,
+            "GINE_CKPTS/resume_{model_id}_{aug_type}_{aug_ratio}.pth".format(
+                model_id=model_id, aug_type=args.aug_type, aug_ratio=args.aug_ratio
+            ),
+        )
+        print("*" * 50)
+        return model, losses, final_ckpt
+    pbar.close()
+    print("*=" * 50)
+    print("Mean KNN ACC: ", torch.Tensor(losses["knn_acc"][-5:]).mean())
+    print("Max KNN ACC: ", torch.Tensor(losses["knn_acc"]).max())
+    print("*=" * 50)
+
+    final_ckpt = {}
+    final_ckpt["knn_acc"] = knn_acc
+    final_ckpt["net"] = model.state_dict()
+    final_ckpt["args"] = dict(args)
+    final_ckpt["stats"] = losses
+    torch.save(
+        final_ckpt,
+        "GINE_CKPTS/final_{model_id}_{aug_type}_{aug_ratio}.pth".format(
+            model_id=model_id, aug_type=args.aug_type, aug_ratio=args.aug_ratio
+        ),
+    )
+
+    return model, losses, best_ckpt
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args = {}
+    args["input_dim"] = 3
+    args["hidden_dim"] = 110
+    args["out_dim"] = 110
+    args["num_layers"] = 4
+    args["batch_size"] = 128
+    args["readout"] = "mean"
+    args["num_mlp_layers"] = 2
+    args["num_classes"] = 10
+    args["epochs"] = 80
+    args["lr"] = 0.3
+    args["seed"] = 41
+    args["readout"] = "mean"
+    args["project_dim"] = 1028
+    args["bottle_neck_dim"] = 128
+    args["predictor_dim"] = 1028
+    args["momentum"] = 0.9
+    args["weight_decay"] = 1e-4
+    args["device"] = device
+    args["label_dim"] = 10
+    args["t_max"] = 8
+    args = dotdict(args)
+    args.dataset = sys.argv[1]
+    args.aug_type = sys.argv[2]
+    args.aug_ratio = float(sys.argv[3])
+
+    print("=" * 50)
+    print("USING DATASET: ", args.dataset)
+    print("USING AUGMENTATION: ", args.aug_type)
+    print("USING AUG RATIO: ", args.aug_ratio)
+    print("=" * 50)
+
+    root_dir = "/home/sc/eslubana/graphssl/AdvCL/Notebooks/"
+    if args.dataset == "MNIST":
+        if args.aug_type == "GRAPH":
+            train_augmentation = MNISTGraphTransform(aug_ratio=args.aug_ratio)
+            eval_augmentation = MNISTEvalTransform()
+        elif args.aug_type == "IMAGE":
+            train_augmentation = MNISTImageTransform()
+            eval_augmentation = MNISTEvalTransform()
+        else:
+            print("ERROR AUG NOT FOUND")
+
+        dataset = torchvision.datasets.MNIST(
+            root=root_dir, download=True, train=True, transform=train_augmentation
+        )
+        test_val_dataset = torchvision.datasets.MNIST(
+            root=root_dir, download=True, train=False, transform=eval_augmentation
+        )
+    elif args.dataset == "CIFAR":
+        args.input_dim = 3
+        print("*" * 50)
+        print("WARNING: NOT INCLUDING POSITIONAL INFO FIXME")
+        print("*" * 50)
+
+        if args.aug_type == "GRAPH":
+            train_augmentation = CIFARGraphTransform(aug_ratio=args.aug_ratio)
+            eval_augmentation = CIFAREvalTransform()
+        elif args.aug_type == "IMAGE":
+            train_augmentation = CIFARImageTransform()
+            eval_augmentation = CIFAREvalTransform()
+        else:
+            print("ERROR AUG NOT FOUND")
+
+        dataset = torchvision.datasets.CIFAR10(
+            root=root_dir, download=True, train=True, transform=train_augmentation
+        )
+        test_val_dataset = torchvision.datasets.CIFAR10(
+            root=root_dir, download=True, train=False, transform=eval_augmentation
+        )
+    train_loader = DataLoader(dataset, batch_size=128, shuffle=True)
+    print("Train Samples: ", len(dataset))
+
+    print("Val+Test Samples: ", len(test_val_dataset))
+    labels = []
+    for d, t in test_val_dataset:
+        labels.append(t)
+
+    test_val_split = int(np.floor(len(test_val_dataset) * 0.5))
+    val_loader = DataLoader(
+        torch.utils.data.Subset(
+            test_val_dataset, np.arange(test_val_split, len(test_val_dataset))
+        ),
+        batch_size=128,
+        shuffle=False,
+    )
+    val_loader.dataset.label_all = labels[test_val_split:]
+
+    test_loader = DataLoader(
+        torch.utils.data.Subset(test_val_dataset, np.arange(0, test_val_split)),
+        batch_size=128,
+        shuffle=False,
+    )
+    test_loader.dataset.label_all = labels[0:test_val_split]
+
+    for sample in train_loader:
+        break
+    """
+    INITIALIZE AND TRAIN MODEL!
+    """
+    backbone = MNIST_GNN(args).to(device)
+
+    print("=" * 50)
+    count_parameters(backbone)
+    print("=" * 50)
+
+    model = SimSiam(backbone=backbone, args=args).to(device)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+    )
+
+    scheduler = None
+    model, loss, ckpt = run_unsupervised(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        val_loader=val_loader,
+        args=args,
+        model_id=args.dataset,
+    )
+
+
+if __name__ == "__main__":
+    main()
