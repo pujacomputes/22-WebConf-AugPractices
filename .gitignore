@@ -3,3 +3,4 @@ chem/*
 */logs/*
 *.log
 *.pth
+**/.ipynb_checkpoints/*
